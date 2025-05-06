@@ -1,0 +1,9 @@
+pandas
+python-dotenv==1.0.1
+presto-python-client==0.8.4
+ibm-cos-sdk==2.13.6
+ipykernel
+pyarrow
+flask 
+flask-cors
+ibm-watson-machine-learning
