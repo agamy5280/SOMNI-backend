@@ -15,6 +15,8 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+print("hello from alaa branch")
+
 wxd_cred = {
     "password": os.getenv("presto_key"),
     "engine_host": os.getenv("presto_host"),
