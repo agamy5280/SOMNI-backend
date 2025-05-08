@@ -15,6 +15,8 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+print("Starting fraud detection service")
+
 wxd_cred = {
     "password": os.getenv("presto_key"),
     "engine_host": os.getenv("presto_host"),
@@ -115,22 +117,96 @@ watsonx_client = IBMWatsonx()
 def get_table_metadata_from_presto(schema_name, table_name, database="hive_data"):
     """Fetch dynamic schema from Presto's information_schema."""
     query = f"""
-    SELECT column_name
+    SELECT column_name, data_type
     FROM {database}.information_schema.columns
     WHERE table_schema = '{schema_name}' AND table_name = '{table_name}'
     ORDER BY ordinal_position
     """
  
     cur.execute(query)
-    columns = [row[0] for row in cur.fetchall()]
- 
+    columns = cur.fetchall()
+    
     if not columns:
         raise Exception(f"No columns found for {schema_name}.{table_name}")
- 
-    metadata = (
-        f'"{database}"."{schema_name}"."{table_name}" (' + ", ".join(columns) + ")"
-    )
-    return metadata
+    
+    # Create more detailed metadata with data types
+    column_details = []
+    for col_name, data_type in columns:
+        column_details.append(f"{col_name} ({data_type})")
+    
+    metadata = f'"{database}"."{schema_name}"."{table_name}" (' + ", ".join(column_details) + ")"
+    return metadata, columns
+
+
+def get_detailed_table_info(schema_name, table_name, database="hive_data"):
+    """Get sample data, date columns, and unique column values for a table."""
+    # First get columns and their types
+    _, columns = get_table_metadata_from_presto(schema_name, table_name, database)
+    
+    # Identify date/timestamp columns
+    date_columns = [col_name for col_name, data_type in columns 
+                   if 'date' in data_type.lower() or 'time' in data_type.lower()]
+    
+    # Get sample data (top 5 rows)
+    try:
+        sample_query = f"""
+        SELECT * FROM {database}.{schema_name}.{table_name} 
+        LIMIT 5
+        """
+        cur.execute(sample_query)
+        sample_data = []
+        if cur.description:
+            sample_columns = [col[0] for col in cur.description]
+            sample_rows = cur.fetchall()
+            for row in sample_rows:
+                sample_data.append(dict(zip(sample_columns, [convert_value(v) for v in row])))
+    except Exception as e:
+        print(f"Error fetching sample data: {e}")
+        sample_data = []
+    
+    # Get unique values for important columns (limited to avoid performance issues)
+    unique_values = {}
+    important_columns = []
+    
+    # Identify important columns based on their names
+    for col_name, data_type in columns:
+        col_lower = col_name.lower()
+        if (any(term in col_lower for term in ['type', 'category', 'status', 'class', 'key', 'id', 'flag'])):
+            important_columns.append(col_name)
+    
+    # Get unique values for important columns (with a reasonable limit)
+    for col_name in important_columns[:5]:  # Limit to 5 columns to prevent performance issues
+        try:
+            distinct_query = f"""
+            SELECT DISTINCT {col_name} 
+            FROM {database}.{schema_name}.{table_name}
+            LIMIT 20
+            """
+            cur.execute(distinct_query)
+            values = [row[0] for row in cur.fetchall() if row[0] is not None]
+            if values:
+                unique_values[col_name] = values
+        except Exception as e:
+            print(f"Error fetching unique values for {col_name}: {e}")
+    
+    # Get current date from database to ensure consistency
+    current_date = None
+    try:
+        cur.execute("SELECT CURRENT_DATE")
+        current_date = cur.fetchone()[0]
+        if isinstance(current_date, datetime.date):
+            current_date = current_date.isoformat()
+    except Exception as e:
+        print(f"Error fetching current date: {e}")
+        # Fallback to system date
+        current_date = datetime.date.today().isoformat()
+    
+    return {
+        "date_columns": date_columns,
+        "sample_data": sample_data,
+        "unique_values": unique_values,
+        "current_date": current_date
+    }
 
 
 def classify_query(user_prompt):
@@ -193,8 +269,14 @@ Provide a concise but informative answer that would help a fraud analyst underst
         return "Unable to process your question about fraud data. Please try rephrasing your query."
 
 
-def generate_hive_sql_query(user_prompt, table_metadata, chat_summary=""):
-    """Use Watsonx.ai to generate Hive SQL from a natural language prompt with optional context."""
+import datetime
+import json
+
+def generate_hive_sql_query(user_prompt, table_metadata, detailed_info, chat_summary="", sql_engine="Presto"):
+    """Use Watsonx.ai to generate SQL from a natural language prompt with optional context.
+    Adjusts SQL generation rules for either Hive or Presto syntax.
+    """
+
     # Add context if available
     context = ""
     if chat_summary:
@@ -204,21 +286,75 @@ CONVERSATION CONTEXT:
 
 This context may help you understand the user's query intent. Consider this history when generating SQL.
 """
-    
+
+    # Format the detailed info for the prompt
+    date_columns_info = ""
+    for table, info in detailed_info.items():
+        if info["date_columns"]:
+            date_columns_info += f"\n{table} date columns: {', '.join(info['date_columns'])}"
+
+    # Get current date from metadata, or fallback to today's date
+    current_date = None
+    for table, info in detailed_info.items():
+        if "current_date" in info and info["current_date"]:
+            current_date = info["current_date"]
+            break
+    if not current_date:
+        current_date = datetime.date.today().isoformat()
+
+    # Unique values for lookup columns
+    unique_values_info = ""
+    for table, info in detailed_info.items():
+        if "unique_values" in info and info["unique_values"]:
+            unique_values_info += f"\n{table} key values:\n"
+            for col, values in info["unique_values"].items():
+                unique_values_info += f"  - {col}: {', '.join(str(v) for v in values[:10])}"
+                if len(values) > 10:
+                    unique_values_info += f" (and {len(values) - 10} more)"
+                unique_values_info += "\n"
+
+    # Sample data preview
+    sample_data_info = ""
+    for table, info in detailed_info.items():
+        if info["sample_data"]:
+            sample_data_info += f"\n{table} sample data (limited preview):\n"
+            sample_data_info += json.dumps(info["sample_data"][:2], indent=2)
+
+    # Date subtraction syntax based on SQL engine
+    if sql_engine.lower() == "presto":
+        date_sub_instruction = (
+            f"- Use DATE '{current_date}' - INTERVAL 'N' DAY for subtracting N days"
+        )
+    else:
+        date_sub_instruction = (
+            f"- Use DATE_SUB(date '{current_date}', N) for N days ago"
+        )
+
+    # Prompt to send to Watsonx
     full_prompt = f"""
-You are an expert Hive SQL Developer.
+You are an expert SQL Developer specializing in fraud analysis queries.
 
 Your task:
-- Read the USER PROMPT.
-- Using the TABLE METADATA{" and CONVERSATION CONTEXT" if chat_summary else ""}, generate a valid Hive SQL query.
+- Read the USER PROMPT carefully.
+- Match the user's intent to the most appropriate table and columns using the metadata provided.
+- Generate a valid {sql_engine} SQL query that answers their question precisely.
 - Output ONLY the SQL query (no explanation, no extra text).
 
+IMPORTANT INFORMATION:
+- Today's date (from database): {current_date}
+- When the user mentions "recent", "last X days", or any date-based filters, use this exact date.
+
 Rules:
-- Use strict Hive SQL syntax.
+- Use strict {sql_engine} SQL syntax.
+- Always use fully qualified table names in the format database.schema_name.table_name.
 - Use single quotes for string literals.
 - Do not use semicolons at the end.
-- Avoid complex subqueries unless explicitly requested.
-- Do not use Oracle-specific functions or keywords.
+- For date/time operations:
+  {date_sub_instruction}
+- Use proper date formatting: YYYY-MM-DD
+- Match user requests to the most appropriate table and columns.
+- Prefer exact column matches over fuzzy matches.
+- Use the unique values listed to help match user requests to appropriate columns.
 - Ensure the query is properly formatted and can be executed directly.
 
 {context if chat_summary else ""}
@@ -234,10 +370,34 @@ TABLE METADATA:
 {table_metadata}
 
 ---
+
+DATE COLUMNS INFO:
+{date_columns_info}
+
+---
+
+KEY COLUMNS AND VALUES:
+{unique_values_info}
+
+---
+
+SAMPLE DATA:
+{sample_data_info}
+
+---
+
+Remember:
+- For time-based queries, use the exact date provided: {current_date}
+- Match user requests to specific columns using the KEY COLUMNS information
+- Always use the correct date operation syntax for {sql_engine}
+- Choose the most appropriate table based on the user's query intent
+- For fraud-specific queries, prioritize using the fraud table
+
+Generate a valid {sql_engine} SQL query:
 """
+
     try:
         sql_query = watsonx_client.send_to_watsonxai(full_prompt)
-        # Clean the SQL query (remove any markdown formatting the LLM might add)
         sql_query = sql_query.strip()
         if sql_query.startswith("```sql"):
             sql_query = sql_query[6:]
@@ -245,20 +405,19 @@ TABLE METADATA:
             sql_query = sql_query[3:]
         if sql_query.endswith("```"):
             sql_query = sql_query[:-3]
-        
-        # Final clean
-        sql_query = sql_query.strip()
-        
-        print("Generated SQL:", sql_query)
-        return sql_query
+        return sql_query.strip()
     except Exception as e:
         print(f"Error generating SQL with Watsonx: {e}")
         return None
 
 
+
 def summarize_result_naturally(sql_query, rows, columns):
     """Ask WatsonX to summarize SQL results into a human-readable format."""
     preview_data = [dict(zip(columns, row)) for row in rows[:5]]
+    
+    total_rows = len(rows)
+    row_count_info = f"The query returned {total_rows} rows in total."
 
     prompt = f"""
 You are a data analyst assistant. You are provided with a SQL query and sample data from the query result. Your job is to summarize the result in a user-friendly way.
@@ -266,10 +425,13 @@ You are a data analyst assistant. You are provided with a SQL query and sample d
 SQL Query:
 {sql_query}
 
-Sample Result Data (only first 5 rows shown as JSON):
+Sample Result Data (first 5 rows shown as JSON):
 {preview_data}
 
-Please summarize what this data tells in one or two clear sentences.
+Additional Info:
+{row_count_info}
+
+Please summarize what this data indicates in 2-3 clear sentences. Focus on what a fraud analyst would find most relevant. Make sure your summary is insightful and actionable.
 """
 
     try:
@@ -422,7 +584,7 @@ def handle_query():
     # These could be dynamically passed by the user in a production system
     schema = "ejada_somni"
     database = "hive_data"
-    tables = ["account", "direct", "client", "frauddata"]
+    tables = ["account", "direct", "client", "fraud"]
     
     title = ""
     is_sql_query = False
@@ -459,23 +621,107 @@ def handle_query():
         # If we reach here, it's an SQL query
         is_sql_query = True
         
+        # Process the user query to identify potential entities, columns, or specific data points
+        query_analysis_prompt = f"""
+You are a data analysis expert. Analyze this query to identify:
+1. Specific entities/categories mentioned (e.g., "fraud type", "transaction category")
+2. Time periods mentioned (e.g., "last 30 days", "this month")
+3. Key metrics requested (e.g., "count", "average", "total")
+
+Query: {user_prompt}
+
+Format your response as JSON with these keys: "entities", "time_period", "metrics"
+Only include keys that are relevant. Be concise and extract ONLY what is explicitly mentioned.
+"""
+        try:
+            query_analysis = watsonx_client.send_to_watsonxai(query_analysis_prompt)
+            # Try to parse as JSON, but don't fail if it's not valid JSON
+            try:
+                query_analysis_json = json.loads(query_analysis)
+                print("Query analysis:", query_analysis_json)
+            except:
+                print("Could not parse query analysis as JSON")
+        except Exception as e:
+            print(f"Query analysis failed: {e}")
+        
         # Get metadata from Presto directly
         combined_schema_parts = []
+        detailed_info = {}
+        # Cache to store column mapping information for faster lookups
+        column_to_table_map = {}
+        
         for table in tables:
             try:
-                metadata = get_table_metadata_from_presto(schema, table, database)
+                metadata, columns = get_table_metadata_from_presto(schema, table, database)
                 combined_schema_parts.append(metadata)
+                
+                # Create a mapping of column names to tables for quick reference
+                for col_name, _ in columns:
+                    col_lower = col_name.lower()
+                    if col_lower not in column_to_table_map:
+                        column_to_table_map[col_lower] = []
+                    column_to_table_map[col_lower].append(table)
+                
+                # Get detailed info for each table including date columns and sample data
+                detailed_info[table] = get_detailed_table_info(schema, table, database)
             except Exception as e:
                 print(f"Error retrieving metadata for {table}: {e}")
         
+        # Create table recommendations based on query analysis and column mapping
+        table_recommendations = []
+        
+        # Get all important words from the query by tokenizing and removing stopwords
+        query_words = user_prompt.lower().split()
+        stopwords = ["the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "with", "by", "about", "as"]
+        query_words = [word for word in query_words if word not in stopwords]
+        
+        # For each table, check how many query words match its columns
+        table_match_scores = {table: 0 for table in tables}
+        
+        # If we have query_analysis_json, use it for better matching
+        try:
+            if 'entities' in query_analysis_json:
+                for entity in query_analysis_json['entities']:
+                    for word in entity.lower().split():
+                        for col, tables in column_to_table_map.items():
+                            if word in col:
+                                for t in tables:
+                                    table_match_scores[t] += 3  # Higher score for entity matches
+        except:
+            pass
+        
+        # Fall back to basic word matching
+        for word in query_words:
+            for col, tables in column_to_table_map.items():
+                if word in col:
+                    for t in tables:
+                        table_match_scores[t] += 1
+        
+        # Special handling for fraud-related queries
+        if "fraud" in user_prompt.lower():
+            table_match_scores["fraud"] += 5
+        
+        # Sort tables by match score
+        sorted_tables = sorted(table_match_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Add table recommendations based on scores
+        for table, score in sorted_tables:
+            if score > 0:
+                table_recommendations.append(f"{table} (relevance score: {score})")
+        
+        # Include table recommendations in metadata
+        if table_recommendations:
+            combined_schema_parts.append("\nRECOMMENDED TABLES (in order of relevance):\n- " + 
+                                        "\n- ".join(table_recommendations))
+                                        
         # Final combined schema as one string
         combined_schema = "1. " + "\n2. ".join(combined_schema_parts)
         
-        # Generate SQL from natural language prompt
+        # Generate SQL from natural language prompt with enhanced metadata
         if chat_summary:
-            generated_sql = generate_hive_sql_query(user_prompt, combined_schema, chat_summary)
+            generated_sql = generate_hive_sql_query(user_prompt, combined_schema, detailed_info, chat_summary)
         else:
-            generated_sql = generate_hive_sql_query(user_prompt, combined_schema)
+            generated_sql = generate_hive_sql_query(user_prompt, combined_schema, detailed_info)
             
         if not generated_sql:
             return jsonify({"error": "Failed to generate SQL", "is_sql_query": True}), 500
@@ -487,11 +733,67 @@ def handle_query():
             print("SQL executed successfully")
         except Exception as sql_error:
             print(f"Error executing SQL: {sql_error}")
-            return jsonify({
-                "error": f"SQL execution error: {str(sql_error)}",
-                "generated_sql": generated_sql,
-                "is_sql_query": True
-            }), 500
+            
+            # Try to fix common SQL errors automatically
+            fix_sql_prompt = f"""
+You are an expert SQL developer. A Hive SQL query failed with the following error:
+{str(sql_error)}
+
+The query that failed was:
+{generated_sql}
+
+Provide a corrected version of the SQL query that would fix this error.
+Focus specifically on:
+1. Using the correct column names (check for typos)
+2. Using the correct date format and functions
+3. Fixing syntax errors
+4. Using the correct table name
+
+Return ONLY the fixed SQL query with no explanations:
+"""
+            try:
+                fixed_sql = watsonx_client.send_to_watsonxai(fix_sql_prompt).strip()
+                # Try to execute the fixed SQL
+                print("Attempting fixed SQL:", fixed_sql)
+                try:
+                    cur.execute(fixed_sql)
+                    print("Fixed SQL executed successfully")
+                    generated_sql = fixed_sql  # Use the fixed SQL going forward
+                except Exception as fixed_error:
+                    # If the fixed SQL also fails, create a user-friendly error message
+                    error_explanation_prompt = f"""
+You are a SQL debugging expert. An SQL query failed with the following error:
+{str(sql_error)}
+
+The query that failed was:
+{generated_sql}
+
+Explain in simple terms what went wrong and how to fix it. Focus on:
+1. Potential syntax errors
+2. Column name issues (especially date columns)
+3. Table access problems
+4. Data type mismatches
+
+Be concise but helpful in your explanation:
+"""
+                    try:
+                        error_explanation = watsonx_client.send_to_watsonxai(error_explanation_prompt)
+                    except:
+                        error_explanation = f"Error executing SQL: {str(sql_error)}"
+                    
+                    return jsonify({
+                        "error": error_explanation,
+                        "generated_sql": generated_sql,
+                        "is_sql_query": True
+                    }), 500
+            except Exception as e:
+                # If automatic fixing fails, return the original error
+                error_explanation = f"Error executing SQL: {str(sql_error)}"
+                return jsonify({
+                    "error": error_explanation,
+                    "generated_sql": generated_sql,
+                    "is_sql_query": True
+                }), 500
 
         if cur.description:
             columns = [col[0] for col in cur.description]
@@ -522,8 +824,9 @@ def handle_query():
         })
         
     except Exception as e:
+        print(f"Unexpected error: {str(e)}")
         return jsonify({
-            "error": str(e),
+            "error": f"An unexpected error occurred: {str(e)}",
         }), 500
 
 
