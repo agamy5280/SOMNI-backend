@@ -352,6 +352,7 @@ Rules:
 - For date/time operations:
   {date_sub_instruction}
 - Use proper date formatting: YYYY-MM-DD
+- if i asked about this month only give me the data in this month not more.
 - Match user requests to the most appropriate table and columns.
 - Prefer exact column matches over fuzzy matches.
 - Use the unique values listed to help match user requests to appropriate columns.
@@ -432,6 +433,7 @@ Additional Info:
 {row_count_info}
 
 Please summarize what this data indicates in 2-3 clear sentences. Focus on what a fraud analyst would find most relevant. Make sure your summary is insightful and actionable.
+,If there is any Currency it is SAR not $. 
 """
 
     try:
