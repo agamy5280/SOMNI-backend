@@ -74,9 +74,12 @@ def answer_general(question, chat_summary=""):
     prompt = f"""
 You are a helpful assistant for fraud analysts.{context}
 
-Question: {question}
+Provide a direct and concise answer to the following question:
+
+{question}
 """
-    return send_to_openai(prompt)
+    return send_to_openai(prompt).strip()
+
 
 # Generate SQL query using metadata
 def generate_duckdb_sql_query(user_prompt, table_metadata, chat_summary=""):
